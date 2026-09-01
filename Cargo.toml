@@ -1,0 +1,35 @@
+[package]
+name = "jxlpeek"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Inspect JPEG XL files without decoding them: container boxes, codestream headers, and web-delivery checks. Offline Rust CLI with no libjxl dependency."
+authors = ["printemps.tokyo <develop@printemps.tokyo>"]
+repository = "https://github.com/printemps-tokyo/jxlpeek"
+homepage = "https://github.com/printemps-tokyo/jxlpeek"
+readme = "README.md"
+keywords = ["jpeg-xl", "jxl", "image", "inspect", "cli"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[[bin]]
+name = "jxlpeek"
+path = "src/main.rs"
+
+[lib]
+name = "jxlpeek"
+path = "src/lib.rs"
+
+[dependencies]
+# Error context for the thin binary layer (org convention).
+anyhow = "1"
+# Argument parsing (derive API, org convention).
+clap = { version = "4", features = ["derive"] }
+# Everything else -- the ISOBMFF box walker, the LSB-first bit reader and the
+# codestream header fields -- is implemented in this crate. No libjxl, no
+# image decoding.
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
