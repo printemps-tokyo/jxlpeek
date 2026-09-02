@@ -45,7 +45,7 @@ jobs:
           shasum -a 256 "jxlpeek-${{ matrix.target }}.tar.gz" \
             > "jxlpeek-${{ matrix.target }}.tar.gz.sha256"
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             jxlpeek-${{ matrix.target }}.tar.gz
