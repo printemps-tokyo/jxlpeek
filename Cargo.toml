@@ -2,6 +2,7 @@
 name = "jxlpeek"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT"
 description = "Inspect JPEG XL files without decoding them: container boxes, codestream headers, and web-delivery checks. Offline Rust CLI with no libjxl dependency."
 authors = ["printemps.tokyo <develop@printemps.tokyo>"]
