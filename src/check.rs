@@ -244,6 +244,37 @@ pub fn run(report: &Report, opts: &Options) -> Vec<Check> {
         }
     }
 
+    // Frames.
+    let list = &report.codestream.frames;
+    if list.damaged {
+        out.push(Check {
+            id: "frames",
+            level: Level::Warn,
+            message: format!(
+                "frame walk stopped: {}; a truncated or damaged file shows partly or not at all",
+                list.note.as_deref().unwrap_or("unknown reason")
+            ),
+        });
+    } else if list.complete && list.trailing_bytes > 0 {
+        out.push(Check {
+            id: "frames",
+            level: Level::Info,
+            message: format!(
+                "{} after the last frame inside the codestream; decoders ignore them",
+                crate::report::bytes(list.trailing_bytes)
+            ),
+        });
+    } else if list.complete && !list.frames.iter().any(|f| f.toc_permuted) {
+        out.push(Check {
+            id: "frames",
+            level: Level::Pass,
+            message: format!(
+                "{} frame(s) walked to the last one; their TOC sizes add up to the codestream length",
+                list.frames.len()
+            ),
+        });
+    }
+
     // Coding.
     let coding = report.coding();
     let coding_level = match coding {
@@ -251,10 +282,16 @@ pub fn run(report: &Report, opts: &Options) -> Vec<Check> {
         _ => Level::Pass,
     };
     let mut coding_msg = coding.describe().to_string();
-    if report.codestream.first_frame.is_some_and(|f| f.is_preview) {
+    let displayed = report
+        .codestream
+        .frames
+        .frames
+        .iter()
+        .any(|f| f.is_displayed());
+    if !displayed && report.codestream.first_frame.is_some_and(|f| f.is_preview) {
         coding_msg.push_str("; the first frame is the preview, the main frame was not inspected");
     }
-    if let Some(note) = &report.codestream.frame_note {
+    if let Some(note) = report.codestream.frame_note.as_ref().filter(|_| !displayed) {
         coding_msg.push_str("; ");
         coding_msg.push_str(note);
     }
@@ -319,11 +356,27 @@ pub fn run(report: &Report, opts: &Options) -> Vec<Check> {
         } else {
             format!("{} loops", anim.num_loops)
         };
+        let list = &report.codestream.frames;
+        let length = if list.frames.is_empty() {
+            "frame count not read".to_string()
+        } else {
+            let ms = crate::frames::ticks_to_ms(
+                list.total_ticks(),
+                anim.tps_numerator,
+                anim.tps_denominator,
+            );
+            format!(
+                "{}{} displayed frames, {:.3} s per loop",
+                if list.complete { "" } else { "at least " },
+                list.displayed(),
+                ms / 1000.0
+            )
+        };
         out.push(Check {
             id: "animation",
             level: Level::Info,
             message: format!(
-                "animated ({}/{} ticks per second, {loops}); frame count needs a full parse",
+                "animated: {length} ({}/{} ticks per second, {loops})",
                 anim.tps_numerator, anim.tps_denominator
             ),
         });

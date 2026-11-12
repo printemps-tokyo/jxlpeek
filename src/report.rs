@@ -74,6 +74,7 @@ pub fn render(
     checks: &[Check],
     verdict: Level,
     show_boxes: bool,
+    show_frames: bool,
     style: Style,
 ) -> String {
     let mut out = String::new();
@@ -165,7 +166,7 @@ pub fn render(
                     s.push_str(" premultiplied");
                 }
                 if !c.name.is_empty() {
-                    let _ = write!(s, " \"{}\"", c.name);
+                    let _ = write!(s, " \"{}\"", printable(&c.name));
                 }
                 s
             })
@@ -193,6 +194,7 @@ pub fn render(
     if let Some((pw, ph)) = img.preview {
         let _ = writeln!(out, "  preview      {pw}x{ph}");
     }
+    let _ = writeln!(out, "  frames       {}", frames_summary(report));
     let tm = &img.tone_mapping;
     let _ = writeln!(
         out,
@@ -246,6 +248,10 @@ pub fn render(
         }
     }
 
+    if show_frames && !report.codestream.frames.frames.is_empty() {
+        render_frames(&mut out, report);
+    }
+
     let _ = writeln!(out, "  checks");
     for c in checks {
         let _ = writeln!(
@@ -258,6 +264,134 @@ pub fn render(
     }
     let _ = writeln!(out, "  verdict      {}", style.level(verdict));
     out
+}
+
+/// Replace control characters so names from the file cannot drive the
+/// terminal.
+pub fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// `3 shown (3 frames, 0.600 s)` and what stopped the walk, if anything.
+pub fn frames_summary(report: &Report) -> String {
+    let list = &report.codestream.frames;
+    let img = &report.codestream.image;
+    if list.frames.is_empty() {
+        return format!(
+            "not inspected: {}",
+            list.note.as_deref().unwrap_or("no frame header")
+        );
+    }
+    let coded = list.frames.iter().filter(|f| !f.is_preview).count();
+    let mut s = format!(
+        "{} displayed of {coded} coded{}",
+        list.displayed(),
+        if list.frames.iter().any(|f| f.is_preview) {
+            " + preview"
+        } else {
+            ""
+        }
+    );
+    if let Some(anim) = &img.animation {
+        let ms = crate::frames::ticks_to_ms(
+            list.total_ticks(),
+            anim.tps_numerator,
+            anim.tps_denominator,
+        );
+        let _ = write!(s, ", {}", seconds(ms));
+        if !list.complete {
+            s.push_str(" so far");
+        }
+    }
+    if let Some(note) = &list.note {
+        let _ = write!(s, "; {note}");
+    }
+    if list.trailing_bytes > 0 {
+        let _ = write!(s, "; {} after the last frame", bytes(list.trailing_bytes));
+    }
+    s
+}
+
+fn seconds(ms: f64) -> String {
+    format!("{:.3} s", ms / 1000.0)
+}
+
+fn milliseconds(ms: f64) -> String {
+    if (ms - ms.round()).abs() < 1e-9 {
+        format!("{} ms", ms.round() as u64)
+    } else {
+        format!("{ms:.2} ms")
+    }
+}
+
+fn render_frames(out: &mut String, report: &Report) {
+    let list = &report.codestream.frames;
+    let anim = report.codestream.image.animation.as_ref();
+    let _ = writeln!(out, "  frame list");
+    let _ = writeln!(
+        out,
+        "    {:>5}  {:<16}  {:<7}  {:<11}  {:<11}  {:>10}  {:<7}  {:>11}  notes",
+        "#", "type", "coding", "size", "origin", "duration", "blend", "bytes"
+    );
+    for (i, f) in list.frames.iter().enumerate() {
+        let duration = match anim {
+            Some(a) if !f.is_preview => milliseconds(crate::frames::ticks_to_ms(
+                u64::from(f.duration_ticks),
+                a.tps_numerator,
+                a.tps_denominator,
+            )),
+            _ => "-".to_string(),
+        };
+        let mut notes = Vec::new();
+        if f.is_preview {
+            notes.push("preview".to_string());
+        }
+        if f.is_last && !f.is_preview {
+            notes.push("last".to_string());
+        }
+        if !f.is_displayed() && !f.is_preview {
+            notes.push("not shown on its own".to_string());
+        }
+        if f.save_as_reference != 0 {
+            notes.push(format!("saved as reference {}", f.save_as_reference));
+        }
+        if f.upsampling > 1 {
+            notes.push(format!("{}x upsampling", f.upsampling));
+        }
+        if f.lf_level > 0 {
+            notes.push(format!("LF level {}", f.lf_level));
+        }
+        if f.num_passes > 1 {
+            notes.push(format!("{} passes", f.num_passes));
+        }
+        if !f.name.is_empty() {
+            notes.push(format!("\"{}\"", printable(&f.name)));
+        }
+        let bytes_text = if f.toc_permuted {
+            "?".to_string()
+        } else {
+            group(f.total_bytes())
+        };
+        let row = format!(
+            "    {:>5}  {:<16}  {:<7}  {:<11}  {:<11}  {:>10}  {:<7}  {:>11}  {}",
+            i,
+            f.frame_type.name(),
+            f.encoding.name(),
+            format!("{}x{}", f.width, f.height),
+            if f.is_normal() {
+                format!("{},{}", f.x0, f.y0)
+            } else {
+                "-".to_string()
+            },
+            duration,
+            if f.is_normal() { f.blend.name() } else { "-" },
+            bytes_text,
+            notes.join(", ")
+        );
+        let _ = writeln!(out, "{}", row.trim_end());
+    }
 }
 
 #[cfg(test)]

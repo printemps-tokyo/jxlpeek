@@ -20,12 +20,19 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     after_help = "Exit codes: 0 no failures (warnings allowed unless --strict), 1 a check failed, 2 a file could not be read or is not JPEG XL."
 )]
 struct Cli {
-    /// JPEG XL files (.jxl) to inspect
+    /// JPEG XL files (.jxl) to inspect; with --compare, also AVIF and WebP
     #[arg(required = true)]
     files: Vec<PathBuf>,
+    /// Compare files side by side (JPEG XL, AVIF, WebP): size, dimensions,
+    /// depth, alpha, coding, frames, duration, color, metadata, bits/pixel
+    #[arg(long, conflicts_with_all = ["boxes", "frames", "strict", "max_bytes", "max_pixels"])]
+    compare: bool,
     /// Also list every container box with offset and size
     #[arg(long)]
     boxes: bool,
+    /// Also list every frame: type, coding, crop, duration, blend mode, bytes
+    #[arg(long)]
+    frames: bool,
     /// Fail when a file is larger than this many bytes
     #[arg(long, value_name = "BYTES")]
     max_bytes: Option<u64>,
@@ -58,6 +65,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    if cli.compare {
+        return Ok(run_compare(&cli));
+    }
     let style = Style::new(
         if cli.no_color {
             ColorChoice::Never
@@ -91,7 +101,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     if i > 0 {
                         text.push('\n');
                     }
-                    text.push_str(&report::render(&rep, &checks, verdict, cli.boxes, style));
+                    text.push_str(&report::render(
+                        &rep, &checks, verdict, cli.boxes, cli.frames, style,
+                    ));
                 }
             }
             Err(err) => {
@@ -119,4 +131,43 @@ fn run(cli: Cli) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn run_compare(cli: &Cli) -> ExitCode {
+    use jxlpeek::compare;
+    let mut summaries = Vec::new();
+    let mut docs = Vec::new();
+    let mut had_error = false;
+    for path in &cli.files {
+        let shown = path.display().to_string();
+        match compare::summarize_path(path) {
+            Ok(s) => {
+                docs.push(compare::summary_json(&s));
+                summaries.push(s);
+            }
+            Err(err) => {
+                had_error = true;
+                if cli.json {
+                    docs.push(json::error_document(&shown, &err.to_string()));
+                } else {
+                    eprintln!("jxlpeek: {shown}: {err}");
+                }
+            }
+        }
+    }
+    if cli.json {
+        println!(
+            "{{\"jxlpeek\":{},\"compare\":[{}],\"verdict\":{}}}",
+            json::quote(VERSION),
+            docs.join(","),
+            json::quote(if had_error { "error" } else { "ok" })
+        );
+    } else if !summaries.is_empty() {
+        print!("{}", compare::render(&summaries));
+    }
+    if had_error {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

@@ -1,11 +1,13 @@
 //! Codestream headers: SizeHeader, ImageMetadata, CustomTransformData and the
-//! first bits of the first FrameHeader (ISO/IEC 18181-1).
+//! first bits of the first FrameHeader (ISO/IEC 18181-1). The full frame list
+//! lives in `frames.rs`.
 //!
 //! Field order, conditions and coders follow libjxl `image_metadata.cc` /
 //! `color_encoding_internal.cc` and jxl-rs `headers/*.rs`. Defaults apply
 //! whenever a field is skipped by its `all_default` flag or condition.
 
 use crate::bits::{unpack_signed, BitReader, HeaderError, Result, U32};
+use crate::frames::{self, FrameList};
 
 /// Bare codestream signature (ISO/IEC 18181-1).
 pub const SIGNATURE: [u8; 2] = [0xff, 0x0a];
@@ -20,6 +22,8 @@ pub struct Codestream {
     pub frame_note: Option<String>,
     /// Bits consumed by SizeHeader + ImageMetadata + CustomTransformData.
     pub header_bits: u64,
+    /// Every frame header and TOC, as far as they can be reached.
+    pub frames: FrameList,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -465,11 +469,13 @@ pub fn parse(data: &[u8]) -> Result<Codestream> {
             Err(err) => (None, Some(format!("first frame header unreadable: {err}"))),
         }
     };
+    let frames = frames::walk(data, header_bits, &image);
     Ok(Codestream {
         image,
         first_frame,
         frame_note,
         header_bits,
+        frames,
     })
 }
 
@@ -1036,6 +1042,133 @@ mod tests {
         assert!(cs.image.color.want_icc);
         assert!(cs.first_frame.is_none());
         assert!(cs.frame_note.unwrap().contains("ICC"));
+    }
+
+    /// One-entry TOC (not permuted) followed by `len` section bytes.
+    fn toc(w: &mut W, len: u64) {
+        w.bits(1, 0).pad().u32_sel(0, 10, len).pad();
+        for _ in 0..len {
+            w.bits(8, 0xaa);
+        }
+    }
+
+    #[test]
+    fn walks_preview_and_animation_frames() {
+        use crate::frames::BlendMode;
+        let mut w = W::default();
+        signature(&mut w);
+        w.bits(1, 1).bits(5, 7).bits(3, 1); // 64x64
+        w.bits(1, 0) // metadata not all_default
+            .bits(1, 1) // extra_fields
+            .bits(3, 0) // orientation 1
+            .bits(1, 0) // no intrinsic size
+            .bits(1, 1) // preview
+            .bits(1, 0) // preview: not div8
+            .u32_sel(0, 6, 15) // ysize 16
+            .bits(3, 1) // 1:1 -> 16x16
+            .bits(1, 1) // animation
+            .u32_sel(0, 0, 0) // 100 ticks per second
+            .u32_sel(0, 0, 0) // / 1
+            .u32_sel(0, 0, 0) // loops forever
+            .bits(1, 0); // no timecodes
+        w.bits(1, 0).u32_sel(0, 0, 0); // 8-bit integer
+        w.bits(1, 1); // modular_16bit_sufficient
+        w.u32_sel(0, 0, 0); // no extra channels
+        w.bits(1, 1); // xyb
+        w.bits(1, 1); // color all_default
+        w.bits(1, 1); // tone mapping all_default
+        w.u32_sel(0, 0, 0); // extensions
+        w.bits(1, 1); // transform all_default
+
+        // Frame 0: the preview, all default.
+        w.pad().bits(1, 1);
+        toc(&mut w, 3);
+        // Frame 1: modular, cropped 32x16 at (4,-2), additive, 50 ticks,
+        // saved as reference 1, named "hi".
+        w.bits(1, 0) // not all_default
+            .bits(2, 0) // regular
+            .bits(1, 1) // modular
+            .u32_sel(0, 0, 0) // flags
+            .u32_sel(0, 0, 0) // upsampling 1
+            .bits(2, 1) // group_size_shift
+            .u32_sel(0, 0, 0) // one pass
+            .bits(1, 1) // have_crop
+            .u32_sel(0, 8, 8) // x0 = 4 (packed signed)
+            .u32_sel(0, 8, 3) // y0 = -2
+            .u32_sel(0, 8, 32) // width
+            .u32_sel(0, 8, 16) // height
+            .u32_sel(1, 0, 0) // blend: add
+            .u32_sel(0, 0, 0) // source
+            .u32_sel(2, 8, 50) // duration 50 ticks
+            .bits(1, 0) // not last
+            .u32_sel(1, 0, 0) // save_as_reference 1
+            .u32_sel(1, 4, 2) // name length 2
+            .bits(8, u64::from(b'h'))
+            .bits(8, u64::from(b'i'))
+            .bits(1, 1) // loop filter all_default
+            .u32_sel(0, 0, 0); // extensions
+        toc(&mut w, 5);
+        // Frame 2: all default, the last frame.
+        w.bits(1, 1);
+        toc(&mut w, 2);
+
+        let data = w.finish();
+        let cs = parse(&data).unwrap();
+        let list = &cs.frames;
+        assert!(list.complete, "{:?}", list.note);
+        assert!(!list.damaged);
+        assert_eq!(list.frames.len(), 3);
+        assert_eq!(list.trailing_bytes, 0);
+        let preview = &list.frames[0];
+        assert!(preview.is_preview);
+        assert_eq!((preview.width, preview.height), (16, 16));
+        assert!(!preview.is_displayed());
+        let crop = &list.frames[1];
+        assert_eq!(crop.encoding, FrameEncoding::Modular);
+        assert_eq!((crop.x0, crop.y0, crop.width, crop.height), (4, -2, 32, 16));
+        assert_eq!(crop.blend, BlendMode::Add);
+        assert_eq!(crop.duration_ticks, 50);
+        assert_eq!(crop.save_as_reference, 1);
+        assert_eq!(crop.name, "hi");
+        assert_eq!(crop.data_bytes, 5);
+        assert!(crop.is_displayed());
+        let last = &list.frames[2];
+        assert!(last.is_last);
+        assert_eq!((last.width, last.height), (64, 64));
+        assert_eq!(list.displayed(), 2);
+        assert_eq!(list.total_ticks(), 50);
+        assert_eq!(
+            last.offset + last.total_bytes(),
+            data.len() as u64,
+            "the walk ends exactly at the end of the stream"
+        );
+
+        // Cut the stream inside frame 1's sections.
+        let cut = &data[..(crop.offset + crop.header_bytes + 2) as usize];
+        let short = parse(cut).unwrap();
+        assert!(short.frames.damaged);
+        assert!(!short.frames.complete);
+        assert!(short
+            .frames
+            .note
+            .unwrap()
+            .contains("ends 3 bytes before frame 1"));
+    }
+
+    #[test]
+    fn permuted_toc_stops_the_walk() {
+        let mut w = W::default();
+        signature(&mut w);
+        w.bits(1, 1).bits(5, 0).bits(3, 1); // 8x8
+        w.bits(1, 1).bits(1, 1); // metadata and transform all_default
+        w.pad().bits(1, 1); // frame all_default
+        w.bits(1, 1).pad(); // TOC permuted
+        let cs = parse(&w.finish()).unwrap();
+        let list = &cs.frames;
+        assert_eq!(list.frames.len(), 1);
+        assert!(list.frames[0].toc_permuted);
+        assert!(list.complete, "the only frame is the last one");
+        assert!(list.note.as_deref().unwrap().contains("permuted"));
     }
 
     #[test]

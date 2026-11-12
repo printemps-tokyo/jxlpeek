@@ -112,11 +112,21 @@ impl Report {
         let xyb = self.codestream.image.xyb_encoded;
         let jbrd = self.container.as_ref().and_then(|c| c.jbrd_len).is_some();
         // A preview frame says nothing about how the main image is coded.
-        let main_frame = self
-            .codestream
-            .first_frame
-            .filter(|f| !f.is_preview)
-            .map(|f| f.encoding);
+        // A preview, an LF frame or a patch source says nothing about how the
+        // displayed image is coded, so prefer the first displayed frame.
+        let frames = &self.codestream.frames;
+        let main_frame = frames
+            .frames
+            .iter()
+            .find(|f| f.is_displayed())
+            .map(|f| f.encoding)
+            .or_else(|| {
+                self.codestream
+                    .first_frame
+                    .filter(|f| !f.is_preview)
+                    .map(|f| f.encoding)
+            })
+            .or_else(|| frames.main_frame().map(|f| f.encoding));
         match main_frame {
             Some(FrameEncoding::VarDct) if xyb => Coding::LossyXyb,
             Some(FrameEncoding::Modular) if xyb => Coding::ModularXyb,

@@ -38,6 +38,16 @@ fn f32_json(v: f32) -> String {
     }
 }
 
+/// Milliseconds rounded to the microsecond, so 1001/30000 s ticks do not
+/// print sixteen digits of float noise.
+fn f64_json(v: f64) -> String {
+    if v.is_finite() {
+        format!("{}", (v * 1000.0).round() / 1000.0)
+    } else {
+        "null".to_string()
+    }
+}
+
 pub fn file_document(report: &Report, checks: &[Check], verdict: Level) -> String {
     let img = &report.codestream.image;
     let mut o = String::new();
@@ -208,6 +218,7 @@ pub fn file_document(report: &Report, checks: &[Check], verdict: Level) -> Strin
             .as_deref()
             .map_or("null".to_string(), quote)
     );
+    frames_json(&mut o, report);
     let coding = report.coding();
     let _ = write!(
         o,
@@ -233,6 +244,73 @@ pub fn file_document(report: &Report, checks: &[Check], verdict: Level) -> Strin
     let _ = write!(o, "\"verdict\":{}", quote(verdict.id()));
     o.push('}');
     o
+}
+
+fn frames_json(o: &mut String, report: &Report) {
+    let list = &report.codestream.frames;
+    let anim = report.codestream.image.animation.as_ref();
+    let ms = |ticks: u64| {
+        anim.map_or("null".to_string(), |a| {
+            f64_json(crate::frames::ticks_to_ms(
+                ticks,
+                a.tps_numerator,
+                a.tps_denominator,
+            ))
+        })
+    };
+    let _ = write!(
+        o,
+        "\"frames\":{{\"complete\":{},\"damaged\":{},\"note\":{},\"coded\":{},\"displayed\":{},\"total_ticks\":{},\"total_ms\":{},\"trailing_bytes\":{},\"list\":[",
+        list.complete,
+        list.damaged,
+        list.note.as_deref().map_or("null".to_string(), quote),
+        list.frames.iter().filter(|f| !f.is_preview).count(),
+        list.displayed(),
+        list.total_ticks(),
+        ms(list.total_ticks()),
+        list.trailing_bytes
+    );
+    for (i, f) in list.frames.iter().enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        let _ = write!(
+            o,
+            "{{\"index\":{i},\"is_preview\":{},\"frame_type\":{},\"encoding\":{},\"offset\":{},\"header_bytes\":{},\"data_bytes\":{},\"toc_entries\":{},\"toc_permuted\":{},\"x0\":{},\"y0\":{},\"width\":{},\"height\":{},\"cropped\":{},\"upsampling\":{},\"lf_level\":{},\"passes\":{},\"blend\":{},\"duration_ticks\":{},\"duration_ms\":{},\"is_last\":{},\"displayed\":{},\"save_as_reference\":{},\"name\":{}}}",
+            f.is_preview,
+            quote(f.frame_type.name()),
+            quote(f.encoding.name()),
+            f.offset,
+            f.header_bytes,
+            if f.toc_permuted {
+                "null".to_string()
+            } else {
+                f.data_bytes.to_string()
+            },
+            f.toc_entries,
+            f.toc_permuted,
+            f.x0,
+            f.y0,
+            f.width,
+            f.height,
+            f.cropped,
+            f.upsampling,
+            f.lf_level,
+            f.num_passes,
+            quote(f.blend.name()),
+            f.duration_ticks,
+            if f.is_preview {
+                "null".to_string()
+            } else {
+                ms(u64::from(f.duration_ticks))
+            },
+            f.is_last,
+            f.is_displayed(),
+            f.save_as_reference,
+            quote(&f.name)
+        );
+    }
+    o.push_str("]},");
 }
 
 pub fn error_document(path: &str, error: &str) -> String {

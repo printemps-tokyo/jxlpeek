@@ -1,5 +1,7 @@
 //! End-to-end tests: run the built binary against the fixtures in
-//! `tests/fixtures` (encoded with cjxl 0.11.1 from synthetic images).
+//! `tests/fixtures` (encoded from synthetic images: the original set with
+//! cjxl 0.11.1; `frames_*` and `cmp_*` with cjxl 0.12.0, avifenc 1.4.2 (aom
+//! 3.15.2), cwebp and img2webp 1.6.0).
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -207,6 +209,148 @@ fn non_jxl_and_broken_files() {
 
     let missing = dir.join("missing.jxl");
     let o = run(&[missing.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn frame_list_matches_jxlinfo() {
+    // jxlinfo -v: three frames of 200 ms.
+    let o = run(&["--frames", &fixture("anim.jxl")]);
+    let s = stdout(&o);
+    assert!(
+        s.contains("frames       3 displayed of 3 coded, 0.600 s"),
+        "{s}"
+    );
+    assert_eq!(s.matches("200 ms").count(), 3, "{s}");
+    assert!(s.contains("PASS frames"), "{s}");
+    assert!(
+        s.contains("animated: 3 displayed frames, 0.600 s per loop"),
+        "{s}"
+    );
+
+    let s = stdout(&run(&["--json", &fixture("anim.jxl")]));
+    assert!(s.contains("\"complete\":true"), "{s}");
+    assert!(s.contains("\"total_ms\":600"), "{s}");
+    assert!(s.contains("\"duration_ms\":200"), "{s}");
+}
+
+#[test]
+fn helper_frames_do_not_decide_the_coding() {
+    // Patches: a reference-only modular frame, then the VarDCT image.
+    let s = stdout(&run(&["--frames", &fixture("frames_patches.jxl")]));
+    assert!(s.contains("1 displayed of 2 coded"), "{s}");
+    assert!(s.contains("reference-only"), "{s}");
+    assert!(s.contains("saved as reference 3"), "{s}");
+    assert!(s.contains("lossy (XYB color space, VarDCT frame)"), "{s}");
+
+    // --progressive_dc=1: an LF frame precedes the main frame.
+    let s = stdout(&run(&["--frames", &fixture("frames_lf.jxl")]));
+    assert!(s.contains("LF level 1"), "{s}");
+    assert!(s.contains("lossy (XYB color space, VarDCT frame)"), "{s}");
+    assert!(s.contains("PASS frames"), "{s}");
+}
+
+#[test]
+fn permuted_toc_is_reported_not_guessed() {
+    let s = stdout(&run(&["--frames", &fixture("frames_permuted.jxl")]));
+    assert!(s.contains("TOC is permuted"), "{s}");
+    assert!(!s.contains("PASS frames"), "{s}");
+    let s = stdout(&run(&["--json", &fixture("frames_permuted.jxl")]));
+    assert!(s.contains("\"toc_permuted\":true"), "{s}");
+    assert!(s.contains("\"data_bytes\":null"), "{s}");
+}
+
+#[test]
+fn truncated_animation_warns() {
+    let dir = std::env::temp_dir().join(format!("jxlpeek-frames-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = std::fs::read(fixture("cmp_anim.jxl")).unwrap();
+    let cut = dir.join("cut.jxl");
+    std::fs::write(&cut, &data[..data.len() - 100]).unwrap();
+    let o = run(&[cut.to_str().unwrap()]);
+    let s = stdout(&o);
+    assert!(s.contains("WARN frames"), "{s}");
+    assert!(s.contains("at least"), "{s}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn compare_lines_up_the_three_formats() {
+    let o = run(&[
+        "--compare",
+        &fixture("cmp_anim.jxl"),
+        &fixture("cmp_anim.avif"),
+        &fixture("cmp_anim.webp"),
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let s = stdout(&o);
+    let row = |label: &str| {
+        s.lines()
+            .find(|l| l.starts_with(label))
+            .unwrap_or_else(|| panic!("no {label} row in {s}"))
+            .to_string()
+    };
+    assert!(row("format").contains("JPEG XL"), "{s}");
+    assert!(row("format").contains("AVIF sequence"), "{s}");
+    assert!(row("format").contains("WebP animation"), "{s}");
+    assert_eq!(row("dimensions").matches("48x36").count(), 3, "{s}");
+    assert_eq!(row("frames").matches('3').count(), 3, "{s}");
+    assert_eq!(row("duration").matches("0.300 s").count(), 3, "{s}");
+    // avifdec: "Repeat Count: Infinite"; webpmux: "Loop Count : 3".
+    assert!(row("loops").contains("forever"), "{s}");
+    assert!(row("loops").contains("loop count 3"), "{s}");
+    // webpmux: two lossy frames and one lossless.
+    assert!(
+        row("coding").contains("mixed lossy (VP8) and lossless (VP8L)"),
+        "{s}"
+    );
+    assert!(
+        row("coding").contains("AV1 High profile, level 2.0, 4:4:4"),
+        "{s}"
+    );
+    assert!(row("vs smallest").contains("1.00x"), "{s}");
+}
+
+#[test]
+fn compare_json_and_errors() {
+    let o = run(&[
+        "--compare",
+        "--json",
+        &fixture("cmp_still.avif"),
+        &fixture("cmp_still.webp"),
+        &fixture("cmp_still.jxl"),
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let s = stdout(&o);
+    assert!(s.starts_with("{\"jxlpeek\":"), "{s}");
+    assert_eq!(s.matches("\"width\":48").count(), 3, "{s}");
+    assert!(s.contains("\"format\":\"AVIF\""), "{s}");
+    assert!(s.contains("\"bytes\":326"), "{s}");
+    assert!(s.contains("\"verdict\":\"ok\""), "{s}");
+
+    let dir = std::env::temp_dir().join(format!("jxlpeek-cmp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("x.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+    let o = run(&[
+        "--compare",
+        png.to_str().unwrap(),
+        &fixture("cmp_still.webp"),
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        stderr(&o).contains("not a JPEG XL, AVIF or WebP file"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(stdout(&o).contains("WebP"), "{}", stdout(&o));
+
+    // Without --compare, AVIF is still not accepted.
+    let o = run(&[&fixture("cmp_still.avif")]);
+    assert_eq!(o.status.code(), Some(2));
+    // --compare does not combine with the check flags.
+    let o = run(&["--compare", "--strict", &fixture("cmp_still.jxl")]);
     assert_eq!(o.status.code(), Some(2));
     std::fs::remove_dir_all(&dir).unwrap();
 }
